@@ -1,0 +1,714 @@
+---
+title: "gt_eprrai"
+author: "Ryoun Ukita"
+date: '2022-10-29'
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Regression based on EPR and RAI
+
+```{r}
+library(countrycode)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(ineq)
+library(survival)
+library(stringr)
+library(glmnet)
+library(Epi)
+library(sem)
+library(ivprobit)
+library(rms)
+library(lme4)
+library(plsRglm)
+library(modelsummary)
+library(mvtnorm)
+
+raimlg <- read.csv("~/ukita-ryoun953@g.ecc.u-tokyo.ac.jp - Google Drive/My Drive/GraduationThesis/RAI_MLG/RAI_MLG_feb2021.csv")
+
+epr <- read.csv("~/ukita-ryoun953@g.ecc.u-tokyo.ac.jp - Google Drive/My Drive/GraduationThesis/EPR/pad+ucdpacd/data.csv")
+
+gdp <- read.csv("~/ukita-ryoun953@g.ecc.u-tokyo.ac.jp - Google Drive/My Drive/GraduationThesis/GDP&pop/Penn.gdp_ver2.csv")
+
+pop <- read.csv("~/ukita-ryoun953@g.ecc.u-tokyo.ac.jp - Google Drive/My Drive/GraduationThesis/GDP&pop/Penn.pop_ver2.csv")
+
+bednarfederal <- read.csv("/Volumes/GoogleDrive-114345131165924653723/My Drive/GraduationThesis/TERRGO/bednarfederal.csv")
+
+mcgarryfederal <- read.csv("/Volumes/GoogleDrive-114345131165924653723/My Drive/GraduationThesis/TERRGO/mcgarryfederal.csv")
+
+```
+
+## filtering contries which exist both datasets 
+```{r}
+eprserbia <- epr %>% filter(countries_gwid == 340)
+raiepr_match <- intersect(raimlg$cowcode, epr$countries_gwid)
+
+raiinepr <- raimlg %>% dplyr::filter(cowcode %in% raiepr_match)
+eprinrai <- epr %>% filter(countries_gwid %in% raiepr_match & isactive == 1)
+
+write.csv(raiinepr, file = "~/ukita-ryoun953@g.ecc.u-tokyo.ac.jp - Google Drive/My Drive/GraduationThesis/RAI_MLG/raiinepr.csv", row.names = FALSE)
+write.csv(eprinrai, file = "~/ukita-ryoun953@g.ecc.u-tokyo.ac.jp - Google Drive/My Drive/GraduationThesis/RAI_MLG/eprinrai.csv", row.names = FALSE)
+write.csv(eprserbia, file = "~/ukita-ryoun953@g.ecc.u-tokyo.ac.jp - Google Drive/My Drive/GraduationThesis/RAI_MLG/eprserbia.csv", row.names = FALSE)
+```
+
+## filling the identifiers in manually
+
+##
+```{r}
+eprinrai_formatch <- read.csv("/Volumes/GoogleDrive-114345131165924653723/My Drive/GraduationThesis/RAI_MLG/eprinrai_ver2.csv")
+raiinepr_formatch <- read.csv("/Volumes/GoogleDrive-114345131165924653723/My Drive/GraduationThesis/RAI_MLG/raiinepr_ver2.csv")
+eprserbia_formatch <- read.csv("/Volumes/GoogleDrive-114345131165924653723/My Drive/GraduationThesis/RAI_MLG/eprserbia_ver2.csv")
+
+eprserbia_formatch$rai_regionid <- as.character(eprserbia_formatch$rai_regionid)
+
+zero <- as.integer(0)
+eprinrai_formatch <- eprinrai_formatch %>%
+  bind_rows(eprserbia_formatch) %>%
+  arrange(gwgroupid, year) %>%
+  filter(isactive == 1 & statusid != 5 & statusid != 1 & statusid != 2 & isrelevant == 1) %>% 
+  separate_rows(rai_regionid, sep = ";")
+
+eprinrai_formatch <- eprinrai_formatch %>%
+  mutate(regaut = coalesce(regaut, zero)) %>%
+  mutate(rai_regionid = coalesce(rai_regionid, as.character("S")))
+
+raiinepr_formatch$regionid <- as.character(raiinepr_formatch$regionid)
+
+raiinepr_formatch_standard <-  raiinepr_formatch %>%
+  filter(tier == 1 & type == "S") %>%
+  group_by(cowcode, year) %>%
+  filter(RAI == max(RAI), popweight == max(popweight)) %>%
+  ungroup()
+
+eprrai_standard <- eprinrai_formatch %>%
+  filter(rai_regionid == "S") %>%
+  inner_join(raiinepr_formatch_standard, by = c("countries_gwid" = "cowcode", "rai_regionid" = "type", "year")) %>%
+  mutate(type = rai_regionid,
+         rai_regionid = regionid)
+
+eprrai_asym <- eprinrai_formatch %>%
+  filter(rai_regionid != "S") %>%
+  inner_join(raiinepr_formatch, by = c("rai_regionid" = "regionid", "year"))
+
+eprrai <- bind_rows(eprrai_standard, eprrai_asym) 
+eprrai <- eprrai %>%
+  dplyr::select(-c(173, 159:171))
+```
+
+## Filtering and mutating variables, joined by GDP and Population
+```{r}
+eprrai <- eprrai %>%
+  dplyr::select(countryname, countries_gwid, year, groupname, gwgroupid, regaut, isactive, isrelevant, groupsize, status_egip, status_pwrrank, excl_groups_count, rlvt_groups_count, incidence_flag, incidence_terr_flag, onset_do_flag, onset_do_terr_flag, onset_ko_flag, onset_ko_terr_flag, warhist, peaceyears, rai_regionid, metro, c(125:159)) %>%
+  mutate(squared_groupsize = (groupsize)^2,
+         postwar = ifelse(warhist >= 1, 1, 0)
+         )
+
+gdp <- gdp %>%
+  mutate(countries_gwid = countrycode(RegionCode, origin = 'iso3c', destination = 'cown', custom_match = c('SRB' = '340','SCG' = '345'))) %>%
+  dplyr::select(countries_gwid, YearCode, AggValue) %>%
+  rename(year = YearCode, gdp = AggValue) %>%
+  arrange(countries_gwid, year) %>%
+  group_by(countries_gwid) %>%
+  mutate(lagged_gdp = lag(gdp)) %>%
+  mutate(lgdp = log(lagged_gdp+1)) %>%
+  ungroup()
+
+pop <- pop %>%
+  mutate(countries_gwid = countrycode(RegionCode, origin = 'iso3c', destination = 'cown', custom_match = c('SRB' = '340','SCG' = '345'))) %>%
+  dplyr::select(countries_gwid, YearCode, AggValue) %>%
+  rename(year = YearCode, pop = AggValue) %>%
+  arrange(countries_gwid, year) %>%
+  mutate(lpop = log(pop+1))
+
+eprrai$countries_gwid <- as.character(eprrai$countries_gwid)
+
+eprrai <- eprrai %>%
+  left_join(gdp, by = c("countries_gwid", "year" ) ) %>%
+  left_join(pop, by = c("countries_gwid", "year" ) )
+
+summary(eprrai)
+```
+
+
+## Add two variables about Federation
+```{r}
+federalchange <- c("Belgium", "Malaysia", "Venezuela", "South Africa")
+eprrai_federalchange <- eprrai %>%
+  filter(countryname %in% federalchange) %>%
+  left_join(mcgarryfederal, by = c("countryname", "year") ) %>%
+  left_join(bednarfederal, by = c("countryname", "year") )
+
+eprrai_federalnochange <- eprrai %>%
+  filter(!(countryname %in% federalchange)) %>%
+  left_join(mcgarryfederal, by = c("countryname")) %>%
+  left_join(bednarfederal, by = c("countryname") ) %>%
+  dplyr::select(-year) %>%
+  rename(year = year.x)
+
+eprrai <- bind_rows(eprrai_federalchange, eprrai_federalnochange)
+eprrai <- eprrai %>%
+  mutate(bednar_federal = coalesce(bednar_federal, zero),
+         mcgarry_federal = coalesce(mcgarry_federal, zero)) %>%
+  group_by(countries_gwid, year) %>%
+  mutate(regaut_groups_count = length(unique(gwgroupid[regaut == 1])),
+         noaut_groups_count = length(unique(gwgroupid[regaut == 0])),
+         ongoing = case_when(
+           length(unique(gwgroupid[incidence_flag == 1])) == 1 & incidence_flag == 1 ~ 0,
+           length(unique(gwgroupid[incidence_flag == 1])) == 1 & incidence_flag == 0 ~ 0,
+           length(unique(gwgroupid[incidence_flag == 1])) > 1 ~ 1,
+           length(unique(gwgroupid[incidence_flag == 1])) == 0 ~ 0
+         )) %>%
+  ungroup()
+
+summary(eprrai)
+```
+
+## Focusing on the regions with the maximum RAI where the ethnic group rules themself
+```{r}
+eprrai_max <- eprrai %>%
+  filter((incidence_terr_flag == 0 & onset_ko_terr_flag == 0)| onset_ko_terr_flag == 1, regaut_groups_count + noaut_groups_count != 1, ) %>%
+  dplyr::select(countries_gwid, countryname, year, gwgroupid, groupname, onset_ko_terr_flag, onset_do_terr_flag, regaut, status_egip, peaceyears, postwar, ongoing, excl_groups_count, bednar_federal, groupsize, squared_groupsize, lgdp, lpop, tier, type, metro, popweight, regaut_groups_count, noaut_groups_count, instdepth, policyautonomy, fiscalautonomy, borrowautonomy, representation, lawmaking, executivecontrol, fiscalcontrol, borrowcontrol, constitutional, selfrule, RAI) %>%
+  mutate(noaut = ifelse(regaut == 1, 0, 1)) %>%
+  arrange(countries_gwid, year, gwgroupid, RAI) %>%
+  group_by(countries_gwid, year, gwgroupid) %>%
+  filter(tier == min(tier)) %>%
+  ungroup() %>%
+  group_by(countries_gwid, year, gwgroupid) %>%
+  filter(RAI == max(RAI)) %>%
+  ungroup() %>%
+  group_by(countries_gwid, year, gwgroupid) %>%
+  filter(popweight == max(popweight)) %>%
+  ungroup()
+
+options(max.print = 50) # add the factor variables indicating above/below/equivalent to the standard regions
+eprrai_max <- eprrai_max %>%
+  arrange(countries_gwid, year, gwgroupid) %>%
+  group_by(countries_gwid, year) %>%
+  mutate(nstandard = length(gwgroupid[type == "S"])) %>%
+  mutate(status_excl = ifelse(status_egip == 0, 1, 0),
+         asym_high = ifelse(regaut == 0, 0,ifelse(selfrule > selfrule[type == "S"], 1, 0)),
+         asym_low = ifelse(regaut == 0, 0,ifelse(selfrule < selfrule[type == "S"], 1, 0)),
+         asym_same = ifelse(regaut == 0, 0,ifelse(selfrule == selfrule[type == "S"], 1, 0)),
+         instdepth_diff = abs(instdepth - max(instdepth)),
+         policyautonomy_diff = abs(policyautonomy - max(policyautonomy)),
+         borrowautonomy_diff = abs(borrowautonomy - max(borrowautonomy)),
+         fiscalautonomy_diff = abs(fiscalautonomy - max(fiscalautonomy)),
+         representation_diff = abs(representation - max(representation)),
+         ethnicselfrule = ifelse(regaut == 0, 0, selfrule),
+         selfrule_diff = abs(ethnicselfrule - max(ethnicselfrule))) %>%
+  ungroup()
+
+eprrai_max <- eprrai_max %>%
+  mutate(political_diff = policyautonomy_diff + representation_diff,
+         fiscal_diff = borrowautonomy_diff + fiscalautonomy_diff)
+
+
+```
+
+
+## Cross tables
+```{r}
+diff_type <- eprrai_max %>% 
+  group_by(selfrule_diff, type) %>% 
+  tally %>% 
+  spread(type, n) %>%
+  rename(Autonomous = A,
+         Dependent = D,
+         Standard = S,
+         Asymmetric = Y) %>%
+  replace_na(replace = list(Autonomous = 0,
+         Dependent = 0,
+         Standard = 0,
+         Asymmetric = 0)) %>%
+  ungroup() %>%
+  gt() %>%
+  tab_options(table.width = pct(50),
+              column_labels.border.top.width = 2, 
+          column_labels.border.top.color = "black", 
+          column_labels.border.bottom.width = 1, 
+          column_labels.border.bottom.color = "black",
+              table.border.top.width = 2,
+              table_body.border.top.color = "black",
+              table.border.bottom.width = 2,
+              table_body.border.bottom.color = "black")
+
+gt::gtsave(diff_type, "/Volumes/GoogleDrive-114345131165924653723/MyDrive/GraduationThesis/RAI_MLG/diff_freq.png")
+
+```
+
+
+## Replication of Cederman(2015) using data from 1950-2018 which countries exist in RAI dataset
+Thus, there is no data for Soviet Union and Yugoslavia (~1992).
+```{r}
+model_cederman <- glm(onset_do_terr_flag ~
+                           status_egip +
+                           regaut +
+                           regaut:status_egip +
+                           postwar +
+                           regaut:postwar +
+                           groupsize +
+                           squared_groupsize +
+                           ongoing +
+                           peaceyears +
+                           bednar_federal +
+                           lpop +
+                           lgdp +
+                           excl_groups_count,
+                      data = eprrai_max,
+                      family = binomial(link = "logit"))
+modelsummary(model_cederman, vcov = ~ countries_gwid, stars = TRUE)
+summary(model_cederman)
+
+```
+## model for selfrule as a whole
+```{r}
+eprrai_all <- eprrai_max
+
+eprrai_aut <- filter(eprrai_max, regaut == 1)
+
+model_selfrule_all <- glm(onset_do_terr_flag ~
+                            selfrule_diff +
+                            ethnicselfrule +
+                            postwar +
+                            postwar:selfrule_diff +
+                            lpop +
+                            lgdp +
+                            ongoing +
+                            peaceyears +
+                            log(groupsize),
+                          data = eprrai_all,
+                          family = binomial(link = "logit"))
+modelsummary(model_selfrule_all, statistic = "conf.int", vcov = ~ countries_gwid, stars = TRUE)
+
+model_selfrule_aut <- glm(onset_do_terr_flag ~
+                            selfrule_diff +
+                            ethnicselfrule +
+                            postwar +
+                            postwar:selfrule_diff +
+                            lpop +
+                            ongoing +
+                            peaceyears +
+                            log(groupsize),
+                      data = eprrai_aut,
+                      family = binomial(link = "logit"))
+modelsummary(model_selfrule_aut, vcov = ~ countries_gwid, stars = TRUE)
+
+
+```
+
+```{r}
+k <- 1000
+
+pars <- model_selfrule_all$coefficients
+vcov <- sandwich::vcovCL(model_selfrule_all, cluster = ~ countries_gwid)  # clustered standard errors
+model_selfrule_all.sim <- rmvnorm(k, pars, vcov)
+
+
+# Relevant data
+sample <- as.data.frame(model.matrix(model_selfrule_all))
+span_selfrule_diff <- seq(from=range(eprrai_all$selfrule_diff)[1],to=range(eprrai_all$selfrule_diff)[2],by=1)
+length_selfrule_diff <- length(span_selfrule_diff)
+
+###########
+# PRE WAR
+###########
+sample.pre <- subset(sample, postwar==0) 
+
+# (1) excluded
+probs_pre_excluded <- matrix(NA,k,length_selfrule_diff)
+for(i in 1:k){
+  model_new <- model_selfrule_all # copy model
+  model_new$coefficients <- model_selfrule_all.sim[i,] # enter new coefs
+  for(j in 1:length(span_selfrule_diff)){
+    sample_new <- sample.pre %>% 
+      mutate(selfrule_diff = span_selfrule_diff[j])
+    probs_pre_excluded[i,j] <- mean(predict(model_new,
+                                   newdata = sample_new %>% mutate(
+                                     groupsize = exp(sample_new[,11]),
+                                     status_excl = 1),
+                                   type = "response"))
+  }
+}
+
+# (2) included
+probs_pre_included <- matrix(NA,k,length_selfrule_diff)
+for(i in 1:k){
+  model_new <- model_selfrule_all # copy model
+  model_new$coefficients <- model_selfrule_all.sim[i,] # enter new coefs
+  for(j in 1:length(span_selfrule_diff)){
+    sample_new <- sample.pre %>% 
+      mutate(selfrule_diff = span_selfrule_diff[j])
+    probs_pre_included[i,j] <- mean(predict(model_new,
+                                   newdata = sample_new %>% mutate(
+                                     groupsize = exp(sample_new[,11]),
+                                     status_excl = 0),
+                                   type = "response"))
+  }
+}
+
+# Make it tidy
+probs_pre_excluded <- as_tibble(probs_pre_excluded)
+colnames(probs_pre_excluded) <- span_selfrule_diff
+probs_pre_excluded <- probs_pre_excluded %>% pivot_longer(cols = everything(),names_to="selfrule_diff",values_to="probability")
+probs_pre_excluded <- probs_pre_excluded %>% mutate(selfrule_diff = as.numeric(selfrule_diff))
+
+probs_pre_included <- as_tibble(probs_pre_included)
+colnames(probs_pre_included) <- span_selfrule_diff
+probs_pre_included <- probs_pre_included %>% pivot_longer(cols = everything(),names_to="selfrule_diff",values_to="probability")
+probs_pre_included <- probs_pre_included %>% mutate(selfrule_diff = as.numeric(selfrule_diff))
+
+# Create lower and upper limits and summarize the simulations
+lower <- 0.025
+higher <- 0.975
+probs_pre_excluded <- probs_pre_excluded %>%
+  group_by(selfrule_diff) %>% 
+  summarise(mean = mean(probability),
+            lo = quantile(probability,lower),
+            hi = quantile(probability,higher)) %>%
+  ungroup()
+probs_pre_included <- probs_pre_included %>%
+  group_by(selfrule_diff) %>% 
+  summarise(mean = mean(probability),
+            lo = quantile(probability,lower),
+            hi = quantile(probability,higher)) %>%
+  ungroup()
+
+plot_pre <- ggplot(probs_pre_excluded, aes(selfrule_diff, probability))
+plot_pre <- plot_pre +
+  geom_line(data=probs_pre_excluded,aes(x=selfrule_diff, y=mean),col="red") +
+  geom_line(data=probs_pre_excluded,aes(x=selfrule_diff, y=lo),lty=2,col="red") +
+  geom_line(data=probs_pre_excluded,aes(x=selfrule_diff, y=hi),lty=2,col="red") +
+  geom_line(data=probs_pre_included,aes(x=selfrule_diff, y=mean),col="blue") +
+  geom_line(data=probs_pre_included,aes(x=selfrule_diff, y=lo),lty=2,col="blue") +
+  geom_line(data=probs_pre_included,aes(x=selfrule_diff, y=hi),lty=2,col="blue")
+
+
+############
+# POST WAR
+############
+sample.post <- subset(sample, postwar==1) 
+
+# (1) excluded
+probs_post_excluded <- matrix(NA,k,length_selfrule_diff)
+for(i in 1:k){
+  model_new <- model_selfrule_all # copy model
+  model_new$coefficients <- model_selfrule_all.sim[i,] # enter new coefs
+  for(j in 1:length(span_selfrule_diff)){
+    sample_new <- sample.post %>% 
+      mutate(selfrule_diff = span_selfrule_diff[j])
+    probs_post_excluded[i,j] <- mean(predict(model_new,
+                                   newdata = sample_new %>% mutate(
+                                     groupsize = exp(sample_new[,11]),
+                                     status_excl = 1),
+                                   type = "response"))
+  }
+}
+
+# (2) included
+probs_post_included <- matrix(NA,k,length_selfrule_diff)
+for(i in 1:k){
+  model_new <- model_selfrule_all # copy model
+  model_new$coefficients <- model_selfrule_all.sim[i,] # enter new coefs
+  for(j in 1:length(span_selfrule_diff)){
+    sample_new <- sample.post %>% 
+      mutate(selfrule_diff = span_selfrule_diff[j])
+    probs_post_included[i,j] <- mean(predict(model_new,
+                                   newdata = sample_new %>% mutate(
+                                     groupsize = exp(sample_new[,11]),
+                                     status_excl = 0),
+                                   type = "response"))
+  }
+}
+
+# Make it tidy
+probs_post_excluded <- as_tibble(probs_post_excluded)
+colnames(probs_post_excluded) <- span_selfrule_diff
+probs_post_excluded <- probs_post_excluded %>% pivot_longer(cols = everything(),names_to="selfrule_diff",values_to="probability")
+probs_post_excluded <- probs_post_excluded %>% mutate(selfrule_diff = as.numeric(selfrule_diff))
+
+probs_post_included <- as_tibble(probs_post_included)
+colnames(probs_post_included) <- span_selfrule_diff
+probs_post_included <- probs_post_included %>% pivot_longer(cols = everything(),names_to="selfrule_diff",values_to="probability")
+probs_post_included <- probs_post_included %>% mutate(selfrule_diff = as.numeric(selfrule_diff))
+
+# Create lower and upper limits and summarize the simulations
+lower <- 0.025
+higher <- 0.975
+probs_post_excluded <- probs_post_excluded %>%
+  group_by(selfrule_diff) %>% 
+  summarise(mean = mean(probability),
+            lo = quantile(probability,lower),
+            hi = quantile(probability,higher)) %>%
+  ungroup()
+probs_post_included <- probs_post_included %>%
+  group_by(selfrule_diff) %>% 
+  summarise(mean = mean(probability),
+            lo = quantile(probability,lower),
+            hi = quantile(probability,higher)) %>%
+  ungroup()
+
+plot_post <- ggplot(probs_post_excluded, aes(selfrule_diff, probability))
+plot_post <- plot_post +
+  geom_line(data=probs_post_excluded,aes(x=selfrule_diff, y=mean),col="red") +
+  geom_line(data=probs_post_excluded,aes(x=selfrule_diff, y=lo),lty=2,col="red") +
+  geom_line(data=probs_post_excluded,aes(x=selfrule_diff, y=hi),lty=2,col="red") +
+  geom_line(data=probs_post_included,aes(x=selfrule_diff, y=mean),col="blue") +
+  geom_line(data=probs_post_included,aes(x=selfrule_diff, y=lo),lty=2,col="blue") +
+  geom_line(data=probs_post_included,aes(x=selfrule_diff, y=hi),lty=2,col="blue")
+
+```
+
+
+## Model for symmetric autonomy
+```{r}
+model_clogit <- clogit(onset_do_terr_flag ~
+                         asym_low +
+                         asym_same +
+                         asym_high +
+                         strata(countries_gwid),
+                       data = eprrai_max)
+
+ summary(model_clogit)
+
+model_full <- glm(onset_do_terr_flag ~
+                    asym_low +
+                    asym_same +
+                    asym_high +
+                    status_egip +
+                    postwar +
+                    groupsize +
+                    excl_groups_count +
+                    lpop +
+                    ongoing +
+                    peaceyears +
+                    asym_low:postwar +
+                    asym_same:postwar +
+                    asym_high:postwar,
+                  data = eprrai_max,
+                  family = binomial(link = "logit")
+                  )
+
+
+modelsummary(model_full, statistic = "{std.error}", vcov = ~ countries_gwid, stars = TRUE)
+
+```
+
+## Focus on the absolute degree in each area of regeional autonomy
+```{r}
+model_abs <- glm(onset_do_terr_flag ~
+                    instdepth +
+                    fiscalautonomy +
+                    representation +
+                    policyautonomy +
+                    instdepth:regaut +
+                    fiscalautonomy:regaut +
+                    representation:regaut +
+                    policyautonomy:regaut +
+                    instdepth:regaut:postwar +
+                    fiscalautonomy:regaut:postwar +
+                    representation:regaut:postwar +
+                    policyautonomy:regaut:postwar +
+                    regaut +
+                    regaut:postwar +
+                    status_egip +
+                    postwar +
+                    groupsize +
+                    ongoing +
+                    lpop +
+                    lgdp +
+                    excl_groups_count,
+                  data = eprrai_max,
+                  family = binomial(link = "logit"))
+modelsummary(model_abs,
+             statistic = "{std.error} ",
+             vcov = ~ countries_gwid, 
+             stars = TRUE)
+```
+## Focus on the difference in degree of each authority
+```{r}
+model_diff <- glm(onset_do_terr_flag ~
+                    instdepth_diff +
+                    fiscalautonomy_diff +
+                    representation_diff +
+                    policyautonomy_diff +
+                    instdepth_diff:regaut +
+                    fiscalautonomy_diff:regaut +
+                    representation_diff:regaut +
+                    policyautonomy_diff:regaut +
+                    instdepth_diff:regaut:postwar +
+                    fiscalautonomy_diff:regaut:postwar +
+                    representation_diff:regaut:postwar +
+                    policyautonomy_diff:regaut:postwar +
+                    regaut +
+                    regaut:postwar +
+                    status_egip +
+                    postwar +
+                    groupsize +
+                    ongoing +
+                    lpop +
+                    lgdp +
+                    excl_groups_count,
+                  data = eprrai_max,
+                  family = binomial(link = "logit"))
+modelsummary(model_diff,
+             statistic = "{std.error} ",
+             vcov = ~ countries_gwid, 
+             stars = TRUE)
+```
+
+
+## Focus on the absolute degree of regional authority, putting principal components
+```{r}
+eprrai_max.pca <- princomp(eprrai_max[,c(25:27,29)], cor = TRUE)
+eprrai_max.pca$loadings
+eprrai_max$pca_moreall <- eprrai_max.pca$scores[,1]
+eprrai_max$pca_lessfiscal <- eprrai_max.pca$scores[,2]
+eprrai_max$pca_lessrep <- eprrai_max.pca$scores[,3]
+eprrai_max$pca_lesspolicy <- eprrai_max.pca$scores[,4]
+
+model_diff_pca <- glm(onset_do_terr_flag ~
+                    pca_moreall +
+                    pca_lessfiscal +
+                    pca_lessrep +
+                    pca_lesspolicy +
+                    pca_moreall:regaut +
+                    pca_lessfiscal:regaut +
+                    pca_lessrep:regaut +
+                    pca_lesspolicy:regaut +
+                    pca_moreall:regaut:postwar +
+                    pca_lessfiscal:regaut:postwar +
+                    pca_lessrep:regaut:postwar +
+                    pca_lesspolicy:regaut:postwar +
+                    regaut +
+                    regaut:postwar +
+                    status_egip +
+                    postwar +
+                    groupsize +
+                    ongoing +
+                    lpop +
+                    lgdp +
+                    excl_groups_count,
+                  data = eprrai_max,
+                  family = binomial(link = "logit"))
+modelsummary(model_diff_pca,
+             statistic = "{std.error} [{conf.low}, {conf.high}]",
+             vcov = ~ countries_gwid, 
+             stars = TRUE)
+```
+
+## Focus on the relative deprivation
+```{r}
+options(max.print = 1000)
+table(eprrai_all$political_diff, eprrai_all$fiscal_diff)
+
+eprrai_all.pca <- princomp(eprrai_all[,c(42,43,45,46)], cor = TRUE)
+summary(eprrai_all.pca)
+eprrai_all.pca$loadings
+
+eprrai_all$pca_allenhanced <- eprrai_all.pca$scores[,1]
+eprrai_all$pca_lowfiscal_highrep <- eprrai_all.pca$scores[,2]
+eprrai_all$pca_highinst_lowrep <- eprrai_all.pca$scores[,3]
+eprrai_all$pca_lowpolicy <- eprrai_all.pca$scores[,4]
+
+
+model_reldep_all <- glm(onset_do_terr_flag ~
+                        status_egip +
+                        regaut +
+                        postwar +
+                        groupsize +
+                        ongoing +
+                        lpop +
+                        regaut:pca_allenhanced +
+                        regaut:pca_lowfiscal_highrep +
+                        regaut:pca_highinst_lowrep +
+                        regaut:pca_lowpolicy +
+                        regaut:postwar:pca_allenhanced +
+                        regaut:postwar:pca_lowfiscal_highrep +
+                        regaut:postwar:pca_highinst_lowrep +
+                        regaut:postwar:pca_lowpolicy  ,
+                      data = eprrai_all,
+                      family = binomial(link = "logit"))
+modelsummary(model_reldep_all, vcov = ~ countries_gwid, stars = TRUE)
+```
+
+
+### Focus on the groups with autonomy
+```{r}
+
+table(eprrai_aut$political_diff, eprrai_aut$fiscal_diff)
+
+## relative
+eprrai_aut.pca <- princomp(eprrai_aut[,c(42,43,45,46)], cor = TRUE)
+summary(eprrai_aut.pca)
+eprrai_aut.pca$loadings
+
+eprrai_aut$pca_allenhanced <- eprrai_aut.pca$scores[,1]
+eprrai_aut$pca_lowfiscal_highrep <- eprrai_aut.pca$scores[,2]
+eprrai_aut$pca_highinst <- eprrai_aut.pca$scores[,3]
+eprrai_aut$pca_lowpolicy <- eprrai_aut.pca$scores[,4]
+
+## absolute
+eprrai_aut_abs.pca <- princomp(eprrai_aut[,c(25:27,29)], cor = TRUE)
+eprrai_aut_abs.pca$loadings
+eprrai_aut$pca_moreall <- eprrai_aut_abs.pca$scores[,1]
+eprrai_aut$pca_lessfiscal <- eprrai_aut_abs.pca$scores[,2]
+eprrai_aut$pca_moreinst_lessrep <- eprrai_aut_abs.pca$scores[,3]
+eprrai_aut$pca_lesspolicy <- eprrai_aut_abs.pca$scores[,4]
+
+```
+
+```{r}
+model_abs_aut <- glm(onset_do_terr_flag ~
+                    pca_moreall +
+                    pca_lessfiscal +
+                    pca_moreinst_lessrep +
+                    pca_lesspolicy +
+                    pca_moreall:postwar +
+                    pca_lessfiscal:postwar +
+                    pca_moreinst_lessrep:postwar +
+                    pca_lesspolicy:postwar +
+                    status_egip +
+                    postwar +
+                    groupsize +
+                    ongoing +
+                    lpop +
+                    excl_groups_count,
+                  data = eprrai_aut,
+                  family = binomial(link = "logit"))
+modelsummary(model_abs_aut,
+             vcov = ~ countries_gwid, 
+             stars = TRUE)
+
+model_reldep_aut <- glm(onset_do_terr_flag ~
+                        status_egip +
+                        postwar +
+                        groupsize +
+                        ongoing +
+                        lpop +
+                        pca_allenhanced +
+                        pca_lowfiscal_highrep +
+                        pca_highinst +
+                        pca_lowpolicy +
+                        postwar:pca_allenhanced +
+                        postwar:pca_lowfiscal_highrep +
+                        postwar:pca_highinst +
+                        postwar:pca_lowpolicy,
+                      data = eprrai_aut,
+                      family = binomial(link = "logit"))
+modelsummary(model_reldep_aut, 
+             vcov = ~ countries_gwid, 
+             stars = TRUE)
+
+```
+
+
+
+
